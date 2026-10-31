@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -35,6 +37,67 @@ _INDEX_HTML = _STATIC_DIR / "index.html"
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 7860
 _WS_PATH = "/ws-lab"
+
+
+def _normalized_origin(value: str) -> tuple[str, str, int] | None:
+    """Parse an HTTP origin to comparable (scheme, host, port) fields."""
+    try:
+        parsed = urlsplit(value)
+        scheme = parsed.scheme.lower()
+        if (
+            scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            return None
+        host = parsed.hostname.rstrip(".")
+        try:
+            host = ipaddress.ip_address(host).compressed
+        except ValueError:
+            host = host.encode("idna").decode("ascii").lower()
+        port = parsed.port or (80 if scheme == "http" else 443)
+    except (UnicodeError, ValueError):
+        return None
+    return scheme, host, port
+
+
+def _configured_origins() -> set[tuple[str, str, int]] | None:
+    configured = os.getenv("WEB_LAB_ALLOWED_ORIGINS", "")
+    if not configured.strip():
+        return None
+    return {
+        normalized
+        for value in configured.split(",")
+        if (normalized := _normalized_origin(value.strip())) is not None
+    }
+
+
+def _origin_is_allowed(origin: str | None, request_host: str | None = None) -> bool:
+    """Reject missing and cross-site Origins; WebSocket handshakes skip CORS."""
+    normalized = _normalized_origin(origin or "")
+    if normalized is None:
+        return False
+
+    configured = _configured_origins()
+    if configured is not None:
+        return normalized in configured
+
+    # The default policy is loopback-only and derives the port from the actual
+    # request Host header. This keeps uvicorn's --port override working.
+    scheme, host, _port = normalized
+    try:
+        address = ipaddress.ip_address(host)
+        loopback = address.is_loopback or bool(
+            address.ipv4_mapped and address.ipv4_mapped.is_loopback
+        )
+    except ValueError:
+        loopback = host == "localhost"
+    request_origin = _normalized_origin(f"{scheme}://{request_host or ''}")
+    return loopback and request_origin == normalized
 
 
 def create_app(*, load_services: bool = True) -> FastAPI:
@@ -99,6 +162,11 @@ def create_app(*, load_services: bool = True) -> FastAPI:
 
     @app.websocket(_WS_PATH)
     async def websocket_lab(websocket: WebSocket):
+        origin = websocket.headers.get("origin")
+        if not _origin_is_allowed(origin, websocket.headers.get("host")):
+            logger.warning("lab websocket rejected: disallowed origin %r", origin)
+            await websocket.close(code=1008, reason="origin not allowed")
+            return
         client = websocket.client
         logger.info(
             "lab websocket upgrade from %s:%s",

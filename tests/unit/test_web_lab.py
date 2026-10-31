@@ -3,9 +3,10 @@ import pytest
 pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from voice_assistant.telephony.stream_xml import websocket_and_status_urls
-from voice_assistant.web.server import _WS_PATH, create_app
+from voice_assistant.web.server import _WS_PATH, _origin_is_allowed, create_app
 
 
 def test_lab_health_and_index():
@@ -51,3 +52,65 @@ def test_lab_runs_without_a_database(monkeypatch):
         assert client.app.state.pool is None
         assert client.get("/health").status_code == 200
         assert client.get("/history?user_id=u&session_id=s").json() == {"messages": []}
+
+
+def test_websocket_origin_defaults_to_loopback_only(monkeypatch):
+    monkeypatch.delenv("WEB_LAB_ALLOWED_ORIGINS", raising=False)
+
+    assert _origin_is_allowed("http://127.0.0.1:9000", "127.0.0.1:9000")
+    assert _origin_is_allowed("http://localhost:9000/", "localhost:9000")
+    assert _origin_is_allowed("http://localhost", "localhost:80")
+    assert _origin_is_allowed("http://[::ffff:127.0.0.1]:9000", "[::ffff:127.0.0.1]:9000")
+    assert not _origin_is_allowed("https://attacker.example", "localhost:9000")
+    assert not _origin_is_allowed("http://localhost:9000", "localhost:7860")
+    assert not _origin_is_allowed(None, "localhost:9000")
+
+
+def test_websocket_origin_allowlist_is_explicit_when_configured(monkeypatch):
+    monkeypatch.setenv(
+        "WEB_LAB_ALLOWED_ORIGINS",
+        "https://voice.example.com:443, https://preview.example.com/",
+    )
+
+    assert _origin_is_allowed("https://voice.example.com", "voice.example.com")
+    assert _origin_is_allowed("https://preview.example.com", "preview.example.com")
+    assert not _origin_is_allowed("http://localhost:7860", "localhost:7860")
+
+
+def test_websocket_origin_allowlist_with_no_valid_values_fails_closed(monkeypatch):
+    monkeypatch.setenv("WEB_LAB_ALLOWED_ORIGINS", " , ")
+
+    assert not _origin_is_allowed("http://localhost:7860", "localhost:7860")
+
+
+def test_websocket_endpoint_rejects_foreign_origin_before_accept():
+    client = TestClient(create_app(load_services=False))
+
+    with pytest.raises(WebSocketDisconnect) as disconnected:
+        with client.websocket_connect(
+            _WS_PATH,
+            headers={"origin": "https://attacker.example", "host": "localhost:7860"},
+        ):
+            pass
+
+    assert disconnected.value.code == 1008
+
+
+def test_websocket_endpoint_accepts_matching_loopback_origin(monkeypatch):
+    connected = False
+
+    async def close_connection(websocket, *, store=None):
+        nonlocal connected
+        connected = True
+        await websocket.close(code=1000)
+
+    monkeypatch.setattr("voice_assistant.web.server._run_lab_session", close_connection)
+    client = TestClient(create_app(load_services=False))
+
+    with client.websocket_connect(
+        _WS_PATH,
+        headers={"origin": "http://localhost:7860", "host": "localhost:7860"},
+    ):
+        pass
+
+    assert connected
