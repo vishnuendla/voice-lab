@@ -12,6 +12,7 @@ from voice_assistant.config import load_project_dotenv
 from voice_assistant.pipecat.prompts import CALL_GREETING
 from voice_assistant.session.store import SessionNotFound, database_url, open_pool, open_session
 from voice_assistant.telephony.handshake import wait_for_vobiz_start
+from voice_assistant.telephony.privacy import caller_user_id
 from voice_assistant.telephony.stream_xml import (
     https_base_url,
     speak_only_xml,
@@ -37,8 +38,8 @@ async def lifespan(app: FastAPI):
     )
     logger.info("loading Pipecat services for phone calls")
     app.state.services = build_services()
-    # CallUUID -> caller number, filled in by /answer so a repeat caller keeps
-    # their memories across calls. Bounded: a call is popped when it starts.
+    # CallUUID -> pseudonymous caller id, filled in by /answer so a repeat
+    # caller keeps memories across calls. Bounded: popped when the call starts.
     app.state.callers = {}
     app.state.pool = None
     dsn = database_url()
@@ -78,11 +79,9 @@ async def answer(request: Request):
             k: request.query_params.get(k) for k in ("CallUUID", "From", "To", "Direction")
         }
     logger.info(
-        "answer %s call=%s from=%s to=%s direction=%s",
+        "answer %s call=%s direction=%s",
         request.method,
         call_meta.get("CallUUID"),
-        call_meta.get("From"),
-        call_meta.get("To"),
         call_meta.get("Direction"),
     )
 
@@ -105,12 +104,10 @@ async def answer(request: Request):
 async def stream_status(request: Request):
     form = await request.form()
     logger.info(
-        "stream status event=%s stream=%s call=%s from=%s to=%s",
+        "stream status event=%s stream=%s call=%s",
         form.get("Event"),
         form.get("StreamID"),
         form.get("CallUUID"),
-        form.get("From"),
-        form.get("To"),
     )
     return PlainTextResponse("OK")
 
@@ -160,14 +157,18 @@ async def websocket_endpoint(websocket: WebSocket):
 # ponytail: a plain dict, so it is per-process and leaks an entry for a call
 # that is answered but never streamed. Move it to the pool if that matters.
 def _remember_caller(app, call_id: str, from_number: str) -> None:
-    app.state.callers[call_id] = from_number
+    hmac_key = os.getenv("CALLER_ID_HMAC_KEY", "").strip() or os.getenv(
+        "VOBIZ_AUTH_TOKEN", ""
+    ).strip()
+    app.state.callers[call_id] = caller_user_id(from_number, hmac_key)
 
 
 async def _open_store(app, call_id: str):
     """SessionStore for this call, or None when persistence is off.
 
-    The caller's number is the user, so their memories and summaries carry
-    across calls; an unknown caller is scoped to this call alone.
+    A keyed digest of the caller's number is the user id, so memories carry
+    across calls without putting the number in the database. Unknown callers
+    are scoped to this call alone.
     """
     pool = getattr(app.state, "pool", None)
     if pool is None or not call_id:
