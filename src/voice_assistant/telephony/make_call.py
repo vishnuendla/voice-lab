@@ -24,14 +24,14 @@ def make_call(settings: TelephonySettings, to_number: str, public_base: str) -> 
         "X-Auth-ID": settings.auth_id,
         "X-Auth-Token": settings.auth_token,
     }
-    print(f"Placing call from {settings.from_number} to {to_number}")
+    print("Placing outbound call through Vobiz.")
     print(f"Answer URL: {answer_url}")
     resp = requests.post(url, json=payload, headers=headers, timeout=30)
-    logger.info("outbound call status=%s body=%s", resp.status_code, resp.text)
+    logger.info("outbound call status=%s", resp.status_code)
     if resp.ok:
-        print(f"Call queued ({resp.status_code}): {resp.text}")
+        print(f"Call queued ({resp.status_code}).")
     else:
-        print(f"Call failed ({resp.status_code}): {resp.text}", file=sys.stderr)
+        print(f"Call failed ({resp.status_code}).", file=sys.stderr)
         raise SystemExit(1)
 
 
@@ -47,7 +47,7 @@ def main() -> None:
         raise SystemExit(1) from exc
 
     if os.getenv("VOBIZ_FROM_NUMBER", "auto").strip().lower() == "auto":
-        print(f"Using current Vobiz number: {settings.from_number}")
+        print("Using the current Vobiz number.")
 
     to = sys.argv[1].strip() if len(sys.argv) > 1 else input("Number to call (+91...): ").strip()
     if not to:
