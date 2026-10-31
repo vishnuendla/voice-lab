@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Voice lab</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: "Segoe UI", system-ui, sans-serif;
+        background: #12141a;
+        color: #e8eaed;
+      }
+      body {
+        max-width: 42rem;
+        margin: 2.5rem auto;
+        padding: 0 1.25rem;
+        line-height: 1.45;
+      }
+      h1 {
+        font-size: 1.35rem;
+        font-weight: 600;
+        margin: 0 0 0.35rem;
+      }
+      p.lede {
+        color: #9aa0a6;
+        margin: 0 0 1.25rem;
+      }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.6rem;
+        margin-bottom: 0.85rem;
+      }
+      button {
+        background: #3c7dff;
+        color: #fff;
+        border: 0;
+        border-radius: 0.4rem;
+        padding: 0.55rem 1rem;
+        font-size: 0.95rem;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+      button.secondary {
+        background: #3c4043;
+      }
+      button.speak {
+        background: #1e8e3e;
+      }
+      button.stop-ai {
+        background: #c5221f;
+      }
+      #status {
+        font-size: 0.9rem;
+        color: #9aa0a6;
+        margin-bottom: 1rem;
+      }
+      #status.error {
+        color: #f28b82;
+      }
+      #log {
+        background: #1b1e26;
+        border-radius: 0.5rem;
+        padding: 0.85rem 1rem;
+        min-height: 12rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.65rem;
+      }
+      .turn h2 {
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: #9aa0a6;
+        margin: 0 0 0.25rem;
+      }
+      .turn p {
+        margin: 0;
+        white-space: pre-wrap;
+      }
+      .turn.bot p {
+        color: #c5d4ff;
+      }
+      .summary {
+        border-left: 3px solid #8ab4f8;
+        background: #232733;
+        border-radius: 0.35rem;
+        padding: 0.6rem 0.8rem;
+      }
+      .summary h2 {
+        color: #8ab4f8;
+      }
+      .summary p {
+        color: #dbe3f7;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Browser voice lab</h1>
+    <p class="lede">
+      Connect, then Speak. Your words appear under You. Press Stop when finished —
+      that send goes to the LLM. The reply appears under Assistant and is spoken.
+      Stop AI cuts the reply so you can speak the next turn. Stay connected for one conversation.
+    </p>
+    <div class="row">
+      <button id="connect" type="button">Connect</button>
+      <button id="disconnect" class="secondary" type="button" disabled>Disconnect</button>
+      <button id="new-chat" class="secondary" type="button">New chat</button>
+    </div>
+    <div class="row">
+      <button id="speak" class="speak" type="button" disabled>Speak</button>
+      <button id="stop" class="secondary" type="button" disabled>Stop</button>
+      <button id="stop-ai" class="stop-ai" type="button" disabled>Stop AI</button>
+    </div>
+    <p id="status">Idle. Connect, then press Speak.</p>
+    <div id="log" aria-live="polite"></div>
+    <script type="module">
+      const statusEl = document.getElementById("status");
+      const logEl = document.getElementById("log");
+      const connectBtn = document.getElementById("connect");
+      const disconnectBtn = document.getElementById("disconnect");
+      const speakBtn = document.getElementById("speak");
+      const stopBtn = document.getElementById("stop");
+      const stopAiBtn = document.getElementById("stop-ai");
+      const newChatBtn = document.getElementById("new-chat");
+
+      // Self-asserted ids, not authentication. Ownership is still checked in SQL,
+      // but anyone can claim any id -- do not expose this lab beyond localhost.
+      function storedId(key) {
+        let value = localStorage.getItem(key);
+        if (!value) {
+          value = crypto.randomUUID();
+          localStorage.setItem(key, value);
+        }
+        return value;
+      }
+
+      const userId = storedId("lab_user_id");
+      let sessionId = storedId("lab_session_id");
+
+      let client = null;
+      let listening = false;
+      let botBusy = false;
+      let userTurnEl = null;
+      let botTurnEl = null;
+      let pendingSummary = false;
+
+      function setStatus(text, isError = false) {
+        statusEl.textContent = text;
+        statusEl.classList.toggle("error", isError);
+      }
+
+      function setButtons() {
+        const connected = Boolean(client);
+        connectBtn.disabled = connected;
+        disconnectBtn.disabled = !connected;
+        speakBtn.disabled = !connected || listening;
+        stopBtn.disabled = !connected || !listening;
+        stopAiBtn.disabled = !connected || !botBusy;
+      }
+
+      function wsUrl() {
+        const proto = location.protocol === "https:" ? "wss:" : "ws:";
+        const query = new URLSearchParams({ user_id: userId, session_id: sessionId });
+        return `${proto}//${location.host}/ws-lab?${query}`;
+      }
+
+      async function loadHistory() {
+        const query = new URLSearchParams({ user_id: userId, session_id: sessionId });
+        try {
+          const response = await fetch(`/history?${query}`);
+          if (!response.ok) return;
+          const { messages = [], summary = "" } = await response.json();
+          addSummary("Last time", summary);
+          for (const message of messages) {
+            const isUser = message.role === "user";
+            setTurnText(addTurn(isUser ? "user" : "bot", isUser ? "You" : "Assistant"),
+                        message.content, false);
+          }
+        } catch (err) {
+          // No persistence configured, or the server is offline. Not fatal.
+        }
+      }
+
+      function addSummary(label, text) {
+        if (!text) return;
+        const wrap = document.createElement("div");
+        wrap.className = "turn summary";
+        wrap.innerHTML = `<h2></h2><p></p>`;
+        wrap.querySelector("h2").textContent = label;
+        wrap.querySelector("p").textContent = text;
+        logEl.appendChild(wrap);
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      function transcriptText(data) {
+        if (!data) return "";
+        if (typeof data === "string") return data;
+        return data.text || data.transcript || data.content || "";
+      }
+
+      function addTurn(role, label) {
+        const wrap = document.createElement("div");
+        wrap.className = `turn ${role}`;
+        wrap.innerHTML = `<h2>${label}</h2><p></p>`;
+        logEl.appendChild(wrap);
+        logEl.scrollTop = logEl.scrollHeight;
+        return wrap.querySelector("p");
+      }
+
+      function setTurnText(el, text, append) {
+        if (!el) return;
+        el.textContent = append ? `${el.textContent}${text}` : text;
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      async function setMic(on) {
+        if (!client) return;
+        if (typeof client.enableMic === "function") {
+          await client.enableMic(on);
+          return;
+        }
+        throw new Error("Mic control is not available in this client");
+      }
+
+      function sendLab(type, data = {}) {
+        if (!client || typeof client.sendClientMessage !== "function") return;
+        client.sendClientMessage(type, data);
+      }
+
+      async function interruptBot() {
+        sendLab("interrupt");
+      }
+
+      async function connect() {
+        setStatus("Loading Pipecat client…");
+        connectBtn.disabled = true;
+        let PipecatClient;
+        let WebSocketTransport;
+        let ProtobufFrameSerializer;
+        try {
+          ({ PipecatClient } = await import(
+            "https://cdn.jsdelivr.net/npm/@pipecat-ai/client-js/+esm"
+          ));
+          ({ WebSocketTransport, ProtobufFrameSerializer } = await import(
+            "https://cdn.jsdelivr.net/npm/@pipecat-ai/websocket-transport/+esm"
+          ));
+        } catch (err) {
+          setStatus(`Could not load client libraries: ${err}`, true);
+          connectBtn.disabled = false;
+          return;
+        }
+
+        logEl.replaceChildren();
+        userTurnEl = null;
+        botTurnEl = null;
+        await loadHistory();
+
+        client = new PipecatClient({
+          transport: new WebSocketTransport({
+            serializer: new ProtobufFrameSerializer(),
+            recorderSampleRate: 16000,
+            playerSampleRate: 24000,
+          }),
+          enableCam: false,
+          enableMic: false,
+          callbacks: {
+            onConnected: () => setStatus("Connected. Press Speak when you want to talk."),
+            onDisconnected: () => {
+              listening = false;
+              botBusy = false;
+              client = null;
+              setButtons();
+              setStatus("Disconnected.");
+            },
+            onError: (error) => setStatus(String(error?.message || error), true),
+            onServerMessage: (data) => {
+              if (data?.type !== "session-summary") return;
+              pendingSummary = false;
+              addSummary("Session summary", data.summary);
+            },
+            onUserTranscript: (data) => {
+              const text = transcriptText(data);
+              if (!text) return;
+              if (!userTurnEl) userTurnEl = addTurn("user", "You");
+              setTurnText(userTurnEl, text, false);
+            },
+            onBotLlmStarted: () => {
+              botBusy = true;
+              botTurnEl = addTurn("bot", "Assistant");
+              setButtons();
+              setStatus("Thinking… free models can take up to 20 seconds.");
+            },
+            onBotLlmText: (data) => {
+              const text = transcriptText(data);
+              if (!text) return;
+              if (!botTurnEl) botTurnEl = addTurn("bot", "Assistant");
+              setTurnText(botTurnEl, text, true);
+            },
+            onBotTranscript: (data) => {
+              const text = transcriptText(data);
+              if (!text) return;
+              if (!botTurnEl) botTurnEl = addTurn("bot", "Assistant");
+              if (!botTurnEl.textContent) setTurnText(botTurnEl, text, false);
+            },
+            onBotStartedSpeaking: () => {
+              botBusy = true;
+              setButtons();
+              setStatus("Assistant speaking… Stop AI to interrupt.");
+            },
+            onBotStoppedSpeaking: () => {
+              botBusy = false;
+              botTurnEl = null;
+              setButtons();
+              if (!listening) setStatus("Press Speak for the next turn.");
+            },
+            onBotLlmStopped: () => {
+              setButtons();
+            },
+          },
+        });
+
+        try {
+          await client.connect({ wsUrl: wsUrl() });
+          await setMic(false);
+          listening = false;
+          botBusy = false;
+          setButtons();
+        } catch (err) {
+          setStatus(`Connect failed: ${err}`, true);
+          client = null;
+          setButtons();
+        }
+      }
+
+      async function startSpeak() {
+        if (!client || listening) return;
+        try {
+          if (botBusy) {
+            await interruptBot();
+            botBusy = false;
+          }
+          userTurnEl = addTurn("user", "You");
+          await setMic(true);
+          sendLab("user-turn-start");
+          listening = true;
+          setButtons();
+          setStatus("Listening… press Stop when your question is finished.");
+        } catch (err) {
+          setStatus(`Could not open microphone: ${err}`, true);
+        }
+      }
+
+      async function stopSpeak() {
+        if (!client || !listening) return;
+        try {
+          await setMic(false);
+          await new Promise((resolve) => setTimeout(resolve, 350));
+          sendLab("user-turn-complete");
+          listening = false;
+          botBusy = true;
+          userTurnEl = null;
+          setButtons();
+          setStatus("Sending to the LLM. Wait for the spoken answer.");
+        } catch (err) {
+          setStatus(`Could not stop microphone: ${err}`, true);
+        }
+      }
+
+      async function stopAi() {
+        if (!client || !botBusy) return;
+        try {
+          await interruptBot();
+          listening = false;
+          botBusy = false;
+          botTurnEl = null;
+          setButtons();
+          setStatus("AI stopped. Press Speak for the next turn.");
+        } catch (err) {
+          setStatus(`Could not stop the assistant: ${err}`, true);
+        }
+      }
+
+      // Ask the server to wrap up while the socket is still open, so the summary
+      // can be shown. The server writes it either way, so giving up is safe.
+      async function requestSummary() {
+        if (!client) return;
+        pendingSummary = true;
+        sendLab("end-session");
+        for (let i = 0; i < 60 && pendingSummary; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        pendingSummary = false;
+      }
+
+      async function disconnect() {
+        listening = false;
+        botBusy = false;
+        try {
+          setStatus("Wrapping up the session\u2026");
+          await requestSummary();
+          if (client) await client.disconnect();
+        } catch (err) {
+          setStatus(`Disconnect failed: ${err}`, true);
+        }
+        client = null;
+        setButtons();
+        setStatus("Disconnected.");
+      }
+
+      newChatBtn.addEventListener("click", async () => {
+        if (client) await disconnect();
+        sessionId = crypto.randomUUID();
+        localStorage.setItem("lab_session_id", sessionId);
+        logEl.replaceChildren();
+        userTurnEl = null;
+        botTurnEl = null;
+        setStatus("New conversation. Press Connect.");
+      });
+
+      connectBtn.addEventListener("click", connect);
+      disconnectBtn.addEventListener("click", disconnect);
+      speakBtn.addEventListener("click", startSpeak);
+      stopBtn.addEventListener("click", stopSpeak);
+      stopAiBtn.addEventListener("click", stopAi);
+      setButtons();
+    </script>
+  </body>
+</html>
