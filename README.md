@@ -42,6 +42,7 @@ Optional overrides (see `.env.example`):
 | `SARVAM_LANGUAGE` | `en-IN` | |
 | `SARVAM_TTS_SPEAKER` | `shubh` | |
 | `WEB_LAB_HOST` / `WEB_LAB_PORT` | `127.0.0.1` / `7860` | |
+| `WEB_LAB_ALLOWED_ORIGINS` | loopback request origin | Comma-separated exact origins; replaces loopback defaults |
 | `DATABASE_URL` | unset | Postgres DSN. Unset = conversations are in-memory only |
 | `MAX_MESSAGES` | `20` | Stored turns replayed into a resumed session |
 | `MEMORY_EXTRACTION` | on | `0` to skip end-of-session summary + memory extraction |
@@ -59,6 +60,8 @@ DATABASE_URL=postgresql://postgres:PASSWORD@localhost:5432/voice_lab
 
 The browser stores a `user_id` and `session_id` in `localStorage`; **New chat** starts a fresh
 conversation. Those ids are not authentication — keep the lab on `127.0.0.1`.
+The WebSocket rejects missing and cross-site browser origins. `WEB_LAB_ALLOWED_ORIGINS` is an
+origin check, not authentication; expose the lab only behind an authenticated trusted proxy.
 
 Resuming the *same* session replays its stored turns. Starting a *new* one instead carries over
 long-term memories: at disconnect the LLM is asked what is worth remembering about the user, and
