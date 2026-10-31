@@ -1,0 +1,34 @@
+# Secrets / local env
+.env
+.env.*
+!.env.example
+.venv/
+
+# Local notes (not product code)
+Personal/
+
+# Runtime / caches
+logs/
+output/
+.idea/
+.vscode/
+.pytest_cache/
+pytest-cache-files*/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+*.log
+
+# Piper / local model downloads (fetched on first telephony run)
+*.onnx
+*.onnx.json
+
+# Leftover empty scaffold dirs (do not recreate)
+pipecat_app/
+vobiz/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.venv-wsl/
