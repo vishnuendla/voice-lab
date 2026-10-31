@@ -5,7 +5,7 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
 from voice_assistant.telephony.stream_xml import websocket_and_status_urls
-from voice_assistant.web.server import _WS_PATH, create_app
+from voice_assistant.web.server import _WS_PATH, _origin_is_allowed, create_app
 
 
 def test_lab_health_and_index():
@@ -51,3 +51,24 @@ def test_lab_runs_without_a_database(monkeypatch):
         assert client.app.state.pool is None
         assert client.get("/health").status_code == 200
         assert client.get("/history?user_id=u&session_id=s").json() == {"messages": []}
+
+
+def test_websocket_origin_defaults_to_loopback_only(monkeypatch):
+    monkeypatch.delenv("WEB_LAB_ALLOWED_ORIGINS", raising=False)
+    monkeypatch.setenv("WEB_LAB_PORT", "8765")
+
+    assert _origin_is_allowed("http://127.0.0.1:8765")
+    assert _origin_is_allowed("http://localhost:8765/")
+    assert not _origin_is_allowed("https://attacker.example")
+    assert not _origin_is_allowed(None)
+
+
+def test_websocket_origin_allowlist_is_explicit_when_configured(monkeypatch):
+    monkeypatch.setenv(
+        "WEB_LAB_ALLOWED_ORIGINS",
+        "https://voice.example.com, https://preview.example.com/",
+    )
+
+    assert _origin_is_allowed("https://voice.example.com")
+    assert _origin_is_allowed("https://preview.example.com")
+    assert not _origin_is_allowed("http://localhost:7860")

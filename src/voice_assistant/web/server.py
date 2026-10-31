@@ -35,6 +35,28 @@ _INDEX_HTML = _STATIC_DIR / "index.html"
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 7860
 _WS_PATH = "/ws-lab"
+_DEFAULT_ORIGIN_HOSTS = ("127.0.0.1", "localhost", "[::1]")
+
+
+def _allowed_origins() -> set[str]:
+    """Return exact browser origins allowed to open the local lab socket."""
+    configured = os.getenv("WEB_LAB_ALLOWED_ORIGINS", "").strip()
+    if configured:
+        return {
+            value.strip().rstrip("/").casefold()
+            for value in configured.split(",")
+            if value.strip()
+        }
+
+    port = os.getenv("WEB_LAB_PORT", str(_DEFAULT_PORT)).strip()
+    return {f"http://{host}:{port}".casefold() for host in _DEFAULT_ORIGIN_HOSTS}
+
+
+def _origin_is_allowed(origin: str | None) -> bool:
+    """Reject missing and cross-site Origins; WebSocket handshakes skip CORS."""
+    if not origin:
+        return False
+    return origin.strip().rstrip("/").casefold() in _allowed_origins()
 
 
 def create_app(*, load_services: bool = True) -> FastAPI:
@@ -99,6 +121,10 @@ def create_app(*, load_services: bool = True) -> FastAPI:
 
     @app.websocket(_WS_PATH)
     async def websocket_lab(websocket: WebSocket):
+        if not _origin_is_allowed(websocket.headers.get("origin")):
+            logger.warning("lab websocket rejected: disallowed origin")
+            await websocket.close(code=1008, reason="origin not allowed")
+            return
         client = websocket.client
         logger.info(
             "lab websocket upgrade from %s:%s",
